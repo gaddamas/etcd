@@ -19,8 +19,11 @@ import (
 	"math"
 	"sync"
 
-	bolt "go.etcd.io/bbolt"
+    "github.com/tecbot/gorocksdb"
 )
+
+// Note: this code is adapted from bbolt backend to etcd
+// ColumnFamily in rocksdb is treated as bucket in boltdb
 
 // safeRangeBucket is a hack to avoid inadvertently reading duplicate keys;
 // overwrites on a bucket should only fetch with limit=1, but safeRangeBucket
@@ -33,21 +36,49 @@ type ReadTx interface {
 
 	UnsafeRange(bucketName []byte, key, endKey []byte, limit int64) (keys [][]byte, vals [][]byte)
 	UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error
+	UnsafeGet(bucketName []byte, key []byte) (val []byte)
 }
 
 type readTx struct {
-	// mu protects accesses to the txReadBuffer
 	mu  sync.RWMutex
-	buf txReadBuffer
+    buf txReadBuffer
+    backend *backend
 
 	// txmu protects accesses to buckets and tx on Range requests.
 	txmu    sync.RWMutex
-	tx      *bolt.Tx
-	buckets map[string]*bolt.Bucket
+	tx      *gorocksdb.Transaction
+	buckets map[string]*gorocksdb.ColumnFamilyHandle
 }
 
 func (rt *readTx) Lock()   { rt.mu.RLock() }
 func (rt *readTx) Unlock() { rt.mu.RUnlock() }
+
+func (rt *readTx) UnsafeGet(bucketName []byte, key []byte) (val []byte) {
+	bn := string(bucketName)
+	rt.txmu.RLock()
+	bucket, ok := rt.buckets[bn]
+	rt.txmu.RUnlock()
+	if !ok {
+		rt.txmu.Lock()
+		bucket = rt.backend.buckets[bn]
+		rt.buckets[bn] = bucket
+		rt.txmu.Unlock()
+	}
+
+	// ignore missing bucket since may have been created in this batch
+	if bucket == nil {
+		return nil
+	}
+
+    ro := gorocksdb.NewDefaultReadOptions()
+    defer ro.Destroy()
+    val, err := rt.backend.db.GetCF(ro, bucket, key)
+    if err != nil {
+        plog.Fatalf("failed to get key %s from bucket %s", key, bucket) 
+    }
+
+    return val 
+}
 
 func (rt *readTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
 	if endKey == nil {
@@ -72,21 +103,30 @@ func (rt *readTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]
 	rt.txmu.RUnlock()
 	if !ok {
 		rt.txmu.Lock()
-		bucket = rt.tx.Bucket(bucketName)
+		bucket = rt.backend.buckets[bn]
 		rt.buckets[bn] = bucket
 		rt.txmu.Unlock()
 	}
 
 	// ignore missing bucket since may have been created in this batch
 	if bucket == nil {
+        plog.Errorf("failed to find bucket %s", bn)
 		return keys, vals
 	}
-	rt.txmu.Lock()
-	c := bucket.Cursor()
-	rt.txmu.Unlock()
 
-	k2, v2 := unsafeRange(c, key, endKey, limit-int64(len(keys)))
-	return append(k2, keys...), append(v2, vals...)
+    ro := gorocksdb.NewDefaultReadOptions()
+    defer ro.Destroy()
+    iter := rt.backend.db.NewIteratorCF(ro, bucket)
+    defer iter.Close()
+    for iter.Seek(key); iter.Valid(); iter.Next() {
+        vals = append(vals, iter.Value().Data())
+        keys = append(keys, iter.Key().Data())
+        if limit == int64(len(keys)) {
+            break
+        }
+    }
+
+    return keys, vals
 }
 
 func (rt *readTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
@@ -95,26 +135,51 @@ func (rt *readTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) err
 		dups[string(k)] = struct{}{}
 		return nil
 	}
+    /*
 	visitNoDup := func(k, v []byte) error {
 		if _, ok := dups[string(k)]; ok {
 			return nil
 		}
 		return visitor(k, v)
 	}
+    */
 	if err := rt.buf.ForEach(bucketName, getDups); err != nil {
 		return err
 	}
-	rt.txmu.Lock()
-	err := unsafeForEach(rt.tx, bucketName, visitNoDup)
-	rt.txmu.Unlock()
-	if err != nil {
-		return err
+	// find/cache bucket
+	bn := string(bucketName)
+	rt.txmu.RLock()
+	bucket, ok := rt.buckets[bn]
+	rt.txmu.RUnlock()
+	if !ok {
+		rt.txmu.Lock()
+		bucket = rt.backend.buckets[bn]
+		rt.buckets[bn] = bucket
+		rt.txmu.Unlock()
 	}
+
+	// ignore missing bucket since may have been created in this batch
+	if bucket == nil {
+        plog.Errorf("failed to find bucket %s", bn)
+		return nil
+	}
+
+	rt.txmu.Lock()
+    ro := gorocksdb.NewDefaultReadOptions()
+    defer ro.Destroy()
+    iter := rt.backend.db.NewIteratorCF(ro, bucket)
+    defer iter.Close()
+	rt.txmu.Unlock()
+    for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+        if err := visitor(iter.Key().Data(), iter.Value().Data()); err != nil {
+            return err
+        }
+    }
 	return rt.buf.ForEach(bucketName, visitor)
 }
 
 func (rt *readTx) reset() {
 	rt.buf.reset()
-	rt.buckets = make(map[string]*bolt.Bucket)
+	rt.buckets = make(map[string]*gorocksdb.ColumnFamilyHandle)
 	rt.tx = nil
 }

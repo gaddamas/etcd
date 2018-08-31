@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
+    "github.com/tecbot/gorocksdb"
 	"go.uber.org/zap"
 )
 
@@ -39,26 +39,58 @@ type BatchTx interface {
 
 type batchTx struct {
 	sync.Mutex
-	tx      *bolt.Tx
+	tx      *gorocksdb.Transaction
 	backend *backend
 
 	pending int
+    buckets map[string]*gorocksdb.ColumnFamilyHandle
 }
 
 func (t *batchTx) UnsafeCreateBucket(name []byte) {
-	_, err := t.tx.CreateBucket(name)
-	if err != nil && err != bolt.ErrBucketExists {
-		if t.backend.lg != nil {
-			t.backend.lg.Fatal(
-				"failed to create a bucket",
-				zap.String("bucket-name", string(name)),
-				zap.Error(err),
-			)
-		} else {
-			plog.Fatalf("cannot create bucket %s (%v)", name, err)
-		}
-	}
-	t.pending++
+    opts := gorocksdb.NewDefaultOptions()
+    opts.SetCreateIfMissingColumnFamilies(true)
+    opts.SetCreateIfMissing(true)
+    plog.Printf("creating bucket %s", name)
+    if t.backend == nil {
+        plog.Error("batch tx has null pointer to backend")
+    } else if t.backend.db == nil {
+        plog.Error("backend has null pointer for db")
+    }
+    cf, err := t.backend.db.CreateColumnFamily(opts, string(name))
+    plog.Printf("created bucket %s", name)
+    if err != nil { 
+	    plog.Fatalf("cannot create bucket %s (%v)", name, err)
+    }
+    if cf != nil {
+        // cache the handle
+        plog.Printf("caching handle for bucket %s", name)
+        t.buckets[string(name)] = cf
+        t.backend.buckets[string(name)] = cf
+    }
+    t.pending++
+}
+
+func (t *batchTx) UnsafeGet(bucketName []byte, key []byte) (val []byte) {
+    bn := string(bucketName)
+    bucket, ok := t.buckets[bn]
+    if !ok {
+        bucket = t.buckets[string(bucketName)]
+        t.buckets[bn] = bucket
+    }
+
+    // ignore missing bucket since may have been created in this batch
+    if bucket == nil {
+        return nil
+    }
+
+    ro := gorocksdb.NewDefaultReadOptions()
+    defer ro.Destroy()
+    val, err := t.backend.db.GetCF(ro, bucket, key)
+    if err != nil {
+        plog.Printf("failed to get key %s, error %s", key, err)
+    }
+
+    return val
 }
 
 // UnsafePut must be called holding the lock on the tx.
@@ -72,7 +104,7 @@ func (t *batchTx) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
 }
 
 func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq bool) {
-	bucket := t.tx.Bucket(bucketName)
+	bucket := t.buckets[string(bucketName)]
 	if bucket == nil {
 		if t.backend.lg != nil {
 			t.backend.lg.Fatal(
@@ -83,12 +115,10 @@ func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq boo
 			plog.Fatalf("bucket %s does not exist", bucketName)
 		}
 	}
-	if seq {
-		// it is useful to increase fill percent when the workloads are mostly append-only.
-		// this can delay the page split and reduce space usage.
-		bucket.FillPercent = 0.9
-	}
-	if err := bucket.Put(key, value); err != nil {
+    wo := gorocksdb.NewDefaultWriteOptions()
+    defer wo.Destroy()
+    //plog.Infof("put key %s into column family %s", key, bucketName)
+	if err := t.backend.db.PutCF(wo, bucket, key, value); err != nil {
 		if t.backend.lg != nil {
 			t.backend.lg.Fatal(
 				"failed to write to a bucket",
@@ -99,12 +129,13 @@ func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq boo
 			plog.Fatalf("cannot put key into bucket (%v)", err)
 		}
 	}
+    //plog.Infof("put key %s into column family %s succeeded", key, bucketName)
 	t.pending++
 }
 
 // UnsafeRange must be called holding the lock on the tx.
-func (t *batchTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
-	bucket := t.tx.Bucket(bucketName)
+func (t *batchTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
+	bucket := t.buckets[string(bucketName)]
 	if bucket == nil {
 		if t.backend.lg != nil {
 			t.backend.lg.Fatal(
@@ -115,10 +146,7 @@ func (t *batchTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]
 			plog.Fatalf("bucket %s does not exist", bucketName)
 		}
 	}
-	return unsafeRange(bucket.Cursor(), key, endKey, limit)
-}
 
-func unsafeRange(c *bolt.Cursor, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
 	if limit <= 0 {
 		limit = math.MaxInt64
 	}
@@ -130,9 +158,13 @@ func unsafeRange(c *bolt.Cursor, key, endKey []byte, limit int64) (keys [][]byte
 		limit = 1
 	}
 
-	for ck, cv := c.Seek(key); ck != nil && isMatch(ck); ck, cv = c.Next() {
-		vs = append(vs, cv)
-		keys = append(keys, ck)
+    ro := gorocksdb.NewDefaultReadOptions()
+    defer ro.Destroy()
+    iter := t.backend.db.NewIteratorCF(ro, bucket)
+    defer iter.Close()
+    for iter.Seek(key); iter.Valid() && isMatch(iter.Key().Data()); iter.Next() {
+        vs = append(vs, iter.Value().Data())
+		keys = append(keys, iter.Key().Data())
 		if limit == int64(len(keys)) {
 			break
 		}
@@ -142,7 +174,7 @@ func unsafeRange(c *bolt.Cursor, key, endKey []byte, limit int64) (keys [][]byte
 
 // UnsafeDelete must be called holding the lock on the tx.
 func (t *batchTx) UnsafeDelete(bucketName []byte, key []byte) {
-	bucket := t.tx.Bucket(bucketName)
+	bucket := t.buckets[string(bucketName)]
 	if bucket == nil {
 		if t.backend.lg != nil {
 			t.backend.lg.Fatal(
@@ -153,7 +185,9 @@ func (t *batchTx) UnsafeDelete(bucketName []byte, key []byte) {
 			plog.Fatalf("bucket %s does not exist", bucketName)
 		}
 	}
-	err := bucket.Delete(key)
+    wo := gorocksdb.NewDefaultWriteOptions()
+    defer wo.Destroy()
+	err := t.backend.db.DeleteCF(wo, bucket, key)
 	if err != nil {
 		if t.backend.lg != nil {
 			t.backend.lg.Fatal(
@@ -170,12 +204,25 @@ func (t *batchTx) UnsafeDelete(bucketName []byte, key []byte) {
 
 // UnsafeForEach must be called holding the lock on the tx.
 func (t *batchTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
-	return unsafeForEach(t.tx, bucketName, visitor)
-}
-
-func unsafeForEach(tx *bolt.Tx, bucket []byte, visitor func(k, v []byte) error) error {
-	if b := tx.Bucket(bucket); b != nil {
-		return b.ForEach(visitor)
+	bucket := t.buckets[string(bucketName)]
+	if bucket == nil {
+		if t.backend.lg != nil {
+			t.backend.lg.Fatal(
+				"failed to find a bucket",
+				zap.String("bucket-name", string(bucketName)),
+			)
+		} else {
+			plog.Fatalf("bucket %s does not exist", bucketName)
+		}
+	}
+    ro := gorocksdb.NewDefaultReadOptions()
+    defer ro.Destroy()
+    iter := t.backend.db.NewIteratorCF(ro, bucket)
+    defer iter.Close()
+    for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+        if err := visitor(iter.Key().Data(), iter.Value().Data()); err != nil {
+            return err
+        }
 	}
 	return nil
 }
@@ -192,6 +239,11 @@ func (t *batchTx) CommitAndStop() {
 	t.Lock()
 	t.commit(true)
 	t.Unlock()
+}
+
+func (t *batchTx) Lock() {
+    plog.Print("geting lock to mutex")
+	t.Mutex.Lock()
 }
 
 func (t *batchTx) Unlock() {
@@ -211,18 +263,18 @@ func (t *batchTx) commit(stop bool) {
 	// commit the last tx
 	if t.tx != nil {
 		if t.pending == 0 && !stop {
+            plog.Printf("no pending transactions to commit")
 			return
 		}
 
 		start := time.Now()
-
-		// gofail: var beforeCommit struct{}
+   
+        plog.Printf("commit transaction")
 		err := t.tx.Commit()
-		// gofail: var afterCommit struct{}
 
-		rebalanceSec.Observe(t.tx.Stats().RebalanceTime.Seconds())
-		spillSec.Observe(t.tx.Stats().SpillTime.Seconds())
-		writeSec.Observe(t.tx.Stats().WriteTime.Seconds())
+		//rebalanceSec.Observe(t.tx.Stats().RebalanceTime.Seconds())
+		//spillSec.Observe(t.tx.Stats().SpillTime.Seconds())
+		//writeSec.Observe(t.tx.Stats().WriteTime.Seconds())
 		commitSec.Observe(time.Since(start).Seconds())
 		atomic.AddInt64(&t.backend.commits, 1)
 
@@ -236,83 +288,8 @@ func (t *batchTx) commit(stop bool) {
 		}
 	}
 	if !stop {
+        plog.Printf("beginning transaction") 
 		t.tx = t.backend.begin(true)
 	}
 }
 
-type batchTxBuffered struct {
-	batchTx
-	buf txWriteBuffer
-}
-
-func newBatchTxBuffered(backend *backend) *batchTxBuffered {
-	tx := &batchTxBuffered{
-		batchTx: batchTx{backend: backend},
-		buf: txWriteBuffer{
-			txBuffer: txBuffer{make(map[string]*bucketBuffer)},
-			seq:      true,
-		},
-	}
-	tx.Commit()
-	return tx
-}
-
-func (t *batchTxBuffered) Unlock() {
-	if t.pending != 0 {
-		t.backend.readTx.mu.Lock()
-		t.buf.writeback(&t.backend.readTx.buf)
-		t.backend.readTx.mu.Unlock()
-		if t.pending >= t.backend.batchLimit {
-			t.commit(false)
-		}
-	}
-	t.batchTx.Unlock()
-}
-
-func (t *batchTxBuffered) Commit() {
-	t.Lock()
-	t.commit(false)
-	t.Unlock()
-}
-
-func (t *batchTxBuffered) CommitAndStop() {
-	t.Lock()
-	t.commit(true)
-	t.Unlock()
-}
-
-func (t *batchTxBuffered) commit(stop bool) {
-	// all read txs must be closed to acquire boltdb commit rwlock
-	t.backend.readTx.mu.Lock()
-	t.unsafeCommit(stop)
-	t.backend.readTx.mu.Unlock()
-}
-
-func (t *batchTxBuffered) unsafeCommit(stop bool) {
-	if t.backend.readTx.tx != nil {
-		if err := t.backend.readTx.tx.Rollback(); err != nil {
-			if t.backend.lg != nil {
-				t.backend.lg.Fatal("failed to rollback tx", zap.Error(err))
-			} else {
-				plog.Fatalf("cannot rollback tx (%s)", err)
-			}
-		}
-		t.backend.readTx.reset()
-	}
-
-	t.batchTx.commit(stop)
-
-	if !stop {
-		t.backend.readTx.tx = t.backend.begin(false)
-	}
-}
-
-func (t *batchTxBuffered) UnsafePut(bucketName []byte, key []byte, value []byte) {
-	t.batchTx.UnsafePut(bucketName, key, value)
-	t.buf.put(bucketName, key, value)
-}
-
-func (t *batchTxBuffered) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
-	t.batchTx.UnsafeSeqPut(bucketName, key, value)
-	t.buf.putSeq(bucketName, key, value)
-}

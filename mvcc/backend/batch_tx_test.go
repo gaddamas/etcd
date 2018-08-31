@@ -15,20 +15,20 @@
 package backend
 
 import (
+    "bytes"
 	"reflect"
 	"testing"
 	"time"
-
-	bolt "go.etcd.io/bbolt"
 )
 
 func TestBatchTxPut(t *testing.T) {
 	b, tmpPath := NewTmpBackend(time.Hour, 10000)
 	defer cleanup(b, tmpPath)
 
-	tx := b.batchTx
-	tx.Lock()
-	defer tx.Unlock()
+	//tx := b.batchTx
+	tx := b.BatchTx()
+	//tx.Lock()
+	//defer tx.Unlock()
 
 	// create bucket
 	tx.UnsafeCreateBucket([]byte("test"))
@@ -39,11 +39,15 @@ func TestBatchTxPut(t *testing.T) {
 
 	// check put result before and after tx is committed
 	for k := 0; k < 2; k++ {
+        plog.Printf("get range 'foo, nil'") 
 		_, gv := tx.UnsafeRange([]byte("test"), []byte("foo"), nil, 0)
+        plog.Printf("value %s", gv)
 		if !reflect.DeepEqual(gv[0], v) {
 			t.Errorf("v = %s, want %s", string(gv[0]), string(v))
 		}
-		tx.commit(false)
+        plog.Print("commit tx")
+		tx.Commit()
+        plog.Print("commit tx done")
 	}
 }
 
@@ -51,9 +55,10 @@ func TestBatchTxRange(t *testing.T) {
 	b, tmpPath := NewTmpBackend(time.Hour, 10000)
 	defer cleanup(b, tmpPath)
 
-	tx := b.batchTx
-	tx.Lock()
-	defer tx.Unlock()
+	//tx := b.batchTx
+	tx := b.BatchTx()
+	//tx.Lock()
+	//defer tx.Unlock()
 
 	tx.UnsafeCreateBucket([]byte("test"))
 	// put keys
@@ -122,9 +127,10 @@ func TestBatchTxDelete(t *testing.T) {
 	b, tmpPath := NewTmpBackend(time.Hour, 10000)
 	defer cleanup(b, tmpPath)
 
-	tx := b.batchTx
-	tx.Lock()
-	defer tx.Unlock()
+	//tx := b.batchTx
+	tx := b.BatchTx()
+	//tx.Lock()
+	//defer tx.Unlock()
 
 	tx.UnsafeCreateBucket([]byte("test"))
 	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
@@ -137,7 +143,7 @@ func TestBatchTxDelete(t *testing.T) {
 		if len(ks) != 0 {
 			t.Errorf("keys on foo = %v, want nil", ks)
 		}
-		tx.commit(false)
+		tx.Commit()
 	}
 }
 
@@ -145,7 +151,7 @@ func TestBatchTxCommit(t *testing.T) {
 	b, tmpPath := NewTmpBackend(time.Hour, 10000)
 	defer cleanup(b, tmpPath)
 
-	tx := b.batchTx
+	tx := b.BatchTx()
 	tx.Lock()
 	tx.UnsafeCreateBucket([]byte("test"))
 	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
@@ -153,19 +159,14 @@ func TestBatchTxCommit(t *testing.T) {
 
 	tx.Commit()
 
-	// check whether put happens via db view
-	b.db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("test"))
-		if bucket == nil {
-			t.Errorf("bucket test does not exit")
-			return nil
-		}
-		v := bucket.Get([]byte("foo"))
-		if v == nil {
-			t.Errorf("foo key failed to written in backend")
-		}
-		return nil
-	})
+    // check whether put happened
+    v := tx.UnsafeGet([]byte("test"), []byte("foo"))
+    if v == nil {
+        t.Errorf("foo key failed to written in backend")
+    }
+    if bytes.Compare([]byte("foo"), v) < 0 {
+        t.Errorf("want bar; got v=%+v", v)
+    }
 }
 
 func TestBatchTxBatchLimitCommit(t *testing.T) {
@@ -174,24 +175,20 @@ func TestBatchTxBatchLimitCommit(t *testing.T) {
 	b, tmpPath := NewTmpBackend(time.Hour, 1)
 	defer cleanup(b, tmpPath)
 
-	tx := b.batchTx
+	tx := b.BatchTx()
 	tx.Lock()
 	tx.UnsafeCreateBucket([]byte("test"))
 	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
 	tx.Unlock()
 
 	// batch limit commit should have been triggered
-	// check whether put happens via db view
-	b.db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("test"))
-		if bucket == nil {
-			t.Errorf("bucket test does not exit")
-			return nil
-		}
-		v := bucket.Get([]byte("foo"))
-		if v == nil {
-			t.Errorf("foo key failed to written in backend")
-		}
-		return nil
-	})
+    // check whether put happened
+    v := tx.UnsafeGet([]byte("test"), []byte("foo"))
+    if v == nil {
+        t.Errorf("foo key failed to written in backend")
+    }
+    if bytes.Compare([]byte("foo"), v) < 0 {
+        t.Errorf("want bar; got v=%+v", v)
+    }
 }
+
