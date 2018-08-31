@@ -19,11 +19,11 @@ import (
 	"os"
 	"time"
 
-	"go.etcd.io/etcd/etcdserver/api/snap"
-	"go.etcd.io/etcd/lease"
-	"go.etcd.io/etcd/mvcc"
-	"go.etcd.io/etcd/mvcc/backend"
-	"go.etcd.io/etcd/raft/raftpb"
+	"github.com/coreos/etcd/etcdserver/api/snap"
+	"github.com/coreos/etcd/lease"
+	"github.com/coreos/etcd/mvcc"
+	"github.com/coreos/etcd/mvcc/backend"
+	"github.com/coreos/etcd/raft/raftpb"
 
 	"go.uber.org/zap"
 )
@@ -31,6 +31,7 @@ import (
 func newBackend(cfg ServerConfig) backend.Backend {
 	bcfg := backend.DefaultBackendConfig()
 	bcfg.Path = cfg.backendPath()
+    bcfg.Buckets = []string{"default", "alarm", "authRoles", "authUsers", "auth", "meta", "key", "members", "members_removed", "cluster", "lease"}
 	bcfg.Logger = cfg.Logger
 	if cfg.QuotaBackendBytes > 0 && cfg.QuotaBackendBytes != DefaultQuotaBytes {
 		// permit 10% excess over quota for disarm
